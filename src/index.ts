@@ -18,6 +18,7 @@
  *                 anything else     → host(s) only
  *   room events   room:hello        → sent on connect: { hasHost, role }
  *                 room:presence     → to host + controllers when counts change
+ *                 room:host         → to non-host sockets when the host appears / leaves: { present }
  *
  * Keepalive: clients send the literal text "ping"; the room auto-replies "pong"
  * without waking (hibernation-friendly, not billed as a message).
@@ -27,6 +28,8 @@ export interface Env {
   ROOMS: DurableObjectNamespace;
   RT_SECRET: string; // shared with the Lovable server function that mints host/control tokens
   ALLOWED_ORIGINS?: string; // comma-separated; empty = allow all
+  /** "1" = /control remotes must present a token. Off until the app mints control tokens (today the /control link itself is the key). */
+  CONTROL_TOKEN_REQUIRED?: string;
 }
 
 type Role = "host" | "viewer" | "display" | "control";
@@ -39,6 +42,7 @@ interface Attachment {
 const ROLES: Role[] = ["host", "viewer", "display", "control"];
 const ROOM_RE = /^[A-Za-z0-9_\-:.]{1,200}$/;
 const PRESENCE_DEBOUNCE_MS = 1500;
+const STALE_MS = 10 * 60_000;
 
 // ───────────────────────────── token (HMAC-SHA256) ─────────────────────────────
 // token = `${exp}.${base64url(HMAC(secret, `${room}|${role}|${exp}`))}`, exp in unix seconds.
@@ -116,7 +120,8 @@ export default {
 
     const role = (url.searchParams.get("role") ?? "viewer") as Role;
     if (!ROLES.includes(role)) return new Response("bad role", { status: 400 });
-    if ((role === "host" || role === "control") && !(await verifyToken(env.RT_SECRET, url.searchParams.get("token"), room, role))) {
+    const needsToken = role === "host" || (role === "control" && env.CONTROL_TOKEN_REQUIRED === "1");
+    if (needsToken && !(await verifyToken(env.RT_SECRET, url.searchParams.get("token"), room, role))) {
       return new Response("unauthorized", { status: 401 });
     }
 
@@ -132,8 +137,10 @@ export default {
 export class Room implements DurableObject {
   private snapshot: string | null | undefined = undefined; // raw JSON payload text; undefined = not loaded yet
   private thumbs: Map<string, unknown> | undefined = undefined;
+  private snapshotAt = 0;
   private presenceTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPresenceSig = "";
+  private lastHostPresent: boolean | undefined = undefined;
 
   constructor(private ctx: DurableObjectState, private env: Env) {
     // Answer keepalives without waking the object.
@@ -175,7 +182,8 @@ export class Room implements DurableObject {
       if (e === "snapshot") {
         const text = JSON.stringify(msg.p ?? null);
         this.snapshot = text;
-        await this.ctx.storage.put("snapshot", text);
+        this.snapshotAt = Date.now();
+        await this.ctx.storage.put({ snapshot: text, snapshotAt: this.snapshotAt });
         this.fanout(this.nonHost(), `{"e":"snapshot","p":${text}}`);
         return;
       }
@@ -258,8 +266,14 @@ export class Room implements DurableObject {
   }
 
   private async sendState(ws: WebSocket, att: Attachment): Promise<void> {
-    if (this.snapshot === undefined) this.snapshot = (await this.ctx.storage.get<string>("snapshot")) ?? null;
-    if (this.snapshot) {
+    if (this.snapshot === undefined) {
+      this.snapshot = (await this.ctx.storage.get<string>("snapshot")) ?? null;
+      this.snapshotAt = (await this.ctx.storage.get<number>("snapshotAt")) ?? 0;
+    }
+    // Never greet a new viewer with last week's captions: without a live host,
+    // only replay state that is less than STALE_MS old.
+    const fresh = this.sockets("host").length > 0 || Date.now() - this.snapshotAt < STALE_MS;
+    if (this.snapshot && fresh) {
       try {
         ws.send(`{"e":"snapshot","p":${this.snapshot}}`);
       } catch {}
@@ -294,6 +308,12 @@ export class Room implements DurableObject {
         displays: this.sockets("display").length,
         controls: this.sockets("control").length,
       };
+      const hostPresent = counts.host > 0;
+      if (hostPresent !== this.lastHostPresent) {
+        // Lets viewers fall back to (or leave) the old path when the host is not on this relay.
+        this.lastHostPresent = hostPresent;
+        this.fanout(this.nonHost(), JSON.stringify({ e: "room:host", p: { present: hostPresent } }));
+      }
       const sig = JSON.stringify(counts);
       if (sig === this.lastPresenceSig) return;
       this.lastPresenceSig = sig;
