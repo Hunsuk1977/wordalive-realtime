@@ -1,0 +1,17 @@
+name = "wordalive-realtime"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# Only the published app (and Lovable previews) may open sockets.
+[vars]
+ALLOWED_ORIGINS = "https://wordalive.app,https://www.wordalive.app,https://wordalive.live,https://www.wordalive.live,*.lovable.app"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "Room"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
+
+# RT_SECRET is set as a secret (dashboard → Settings → Variables and Secrets), never committed.
