@@ -84,6 +84,19 @@ export default {
     const url = new URL(req.url);
 
     if (url.pathname === "/health") return new Response("ok");
+    if (url.pathname === "/diag") {
+      // No secrets revealed: only whether one is set, its length, and an 8-char hash prefix to compare.
+      const secret = env.RT_SECRET ?? "";
+      const digest = secret ? b64url(await crypto.subtle.digest("SHA-256", enc.encode(secret))).slice(0, 8) : null;
+      let room = "unreachable";
+      try {
+        const r = await env.ROOMS.get(env.ROOMS.idFromName("diag:ping")).fetch("https://do/__ping");
+        room = await r.text();
+      } catch (e) {
+        room = "error: " + String(e);
+      }
+      return Response.json({ secretSet: !!secret, secretLen: secret.length, secretHash: digest, durableObject: room, origins: env.ALLOWED_ORIGINS ?? "" });
+    }
     if (url.pathname === "/selftest") return new Response(SELFTEST_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
 
     const m = url.pathname.match(/^\/room\/(.+)$/);
@@ -129,6 +142,7 @@ export class Room implements DurableObject {
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
+    if (url.pathname === "/__ping") return new Response("ok");
     const role = (url.searchParams.get("role") ?? "viewer") as Role;
     const att: Attachment = { role, thumbs: url.searchParams.get("thumbs") === "1", at: Date.now() };
 
