@@ -36,3 +36,14 @@ echo 'RT_SECRET="test-secret-123"' > .dev.vars
 npx wrangler dev --port 8787
 node test/load.mjs            # VIEWERS=200 node test/load.mjs
 ```
+
+## Usage numbers (`/stats`)
+
+Every room counts the frames it receives and delivers, the most phones connected at once, and how many sockets opened per role.
+It reports to one `Registry` object (at most once per `STATS_REPORT_MS`, default 30 s, while a room is active). Kept 21 days.
+
+`GET /stats?k=<key>&days=2` — `key` is the first 24 characters of `base64url(HMAC_SHA256(RT_SECRET, "stats|v1"))`.
+Without the key the path answers 404. Days are UTC. `/selftest` and `/diag` rooms are not counted.
+Counters are best-effort and can never affect a room (all reporting is wrapped in try/catch).
+
+Deploying this version adds migration `v2` (new Durable Object class `Registry`); `npx wrangler deploy` applies it.

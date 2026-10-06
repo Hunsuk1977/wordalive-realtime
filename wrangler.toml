@@ -10,8 +10,16 @@ ALLOWED_ORIGINS = "https://wordalive.app,https://www.wordalive.app,https://worda
 name = "ROOMS"
 class_name = "Room"
 
+[[durable_objects.bindings]]
+name = "STATS"
+class_name = "Registry"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Room"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Registry"]
 
 # RT_SECRET is set as a secret (dashboard → Settings → Variables and Secrets), never committed.

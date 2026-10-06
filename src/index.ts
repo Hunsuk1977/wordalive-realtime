@@ -26,10 +26,14 @@
 
 export interface Env {
   ROOMS: DurableObjectNamespace;
+  /** Single "registry" object that collects per-room usage counters for /stats. */
+  STATS: DurableObjectNamespace;
   RT_SECRET: string; // shared with the Lovable server function that mints host/control tokens
   ALLOWED_ORIGINS?: string; // comma-separated; empty = allow all
   /** "1" = /control remotes must present a token. Off until the app mints control tokens (today the /control link itself is the key). */
   CONTROL_TOKEN_REQUIRED?: string;
+  /** How long after activity a room reports its counters to the registry (default 30000 ms). */
+  STATS_REPORT_MS?: string;
 }
 
 type Role = "host" | "viewer" | "display" | "control";
@@ -43,6 +47,33 @@ const ROLES: Role[] = ["host", "viewer", "display", "control"];
 const ROOM_RE = /^[A-Za-z0-9_\-:.]{1,200}$/;
 const PRESENCE_DEBOUNCE_MS = 1500;
 const STALE_MS = 10 * 60_000;
+const STATS_KEEP_DAYS = 21;
+
+/** Usage counters of one room for one UTC day. Counted per frame, so they track what a metered relay would bill. */
+interface RoomStats {
+  day: string; // UTC date YYYY-MM-DD
+  opened: Record<Role, number>; // sockets opened today, by role
+  msgsIn: number; // frames received from clients (keepalive pings are answered by the runtime and not counted)
+  msgsOut: number; // frames sent to clients
+  peakViewers: number; // most phones (viewer role) connected at once
+  peakSockets: number; // most non-host sockets connected at once
+  firstAt: number;
+  lastAt: number;
+}
+
+const utcDay = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
+const freshStats = (): RoomStats => ({
+  day: utcDay(),
+  opened: { host: 0, viewer: 0, display: 0, control: 0 },
+  msgsIn: 0,
+  msgsOut: 0,
+  peakViewers: 0,
+  peakSockets: 0,
+  firstAt: Date.now(),
+  lastAt: Date.now(),
+});
+/** Test rooms (/selftest, /diag) never show up in the usage numbers. */
+const isCountedRoom = (name: string) => !!name && !name.startsWith("selftest-") && !name.startsWith("diag:");
 
 // ───────────────────────────── token (HMAC-SHA256) ─────────────────────────────
 // token = `${exp}.${base64url(HMAC(secret, `${room}|${role}|${exp}`))}`, exp in unix seconds.
@@ -101,6 +132,16 @@ export default {
       }
       return Response.json({ secretSet: !!secret, secretLen: secret.length, secretHash: digest, durableObject: room, origins: env.ALLOWED_ORIGINS ?? "" });
     }
+    if (url.pathname === "/stats") {
+      // Usage numbers for the operator. The key is derived from RT_SECRET (`hmac(secret, "stats|v1")`, first 24 chars)
+      // so it never has to be stored; anything else looks like a missing page.
+      const k = url.searchParams.get("k") ?? "";
+      const expected = env.RT_SECRET ? (await hmac(env.RT_SECRET, "stats|v1")).slice(0, 24) : "";
+      if (!expected || !safeEqual(expected, k)) return new Response("not found", { status: 404 });
+      const q = new URLSearchParams();
+      q.set("days", url.searchParams.get("days") ?? "2");
+      return env.STATS.get(env.STATS.idFromName("registry")).fetch(`https://do/stats?${q}`);
+    }
     if (url.pathname === "/selftest") return new Response(SELFTEST_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
 
     const m = url.pathname.match(/^\/room\/(.+)$/);
@@ -141,6 +182,9 @@ export class Room implements DurableObject {
   private presenceTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPresenceSig = "";
   private lastHostPresent: boolean | undefined = undefined;
+  private st: RoomStats | undefined = undefined; // today's usage counters (persisted by flushStats)
+  private roomName = "";
+  private reportTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private ctx: DurableObjectState, private env: Env) {
     // Answer keepalives without waking the object.
@@ -152,6 +196,11 @@ export class Room implements DurableObject {
     if (url.pathname === "/__ping") return new Response("ok");
     const role = (url.searchParams.get("role") ?? "viewer") as Role;
     const att: Attachment = { role, thumbs: url.searchParams.get("thumbs") === "1", at: Date.now() };
+    try {
+      await this.loadStats(decodeURIComponent(url.pathname.replace(/^\/room\//, "")));
+      const st = this.touch();
+      if (st) st.opened[role] = (st.opened[role] ?? 0) + 1;
+    } catch {}
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -162,6 +211,7 @@ export class Room implements DurableObject {
     this.sendTo(server, "room:hello", { role, hasHost });
     if (role !== "host") await this.sendState(server, att);
     this.schedulePresence();
+    this.reportSoon();
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -177,6 +227,12 @@ export class Room implements DurableObject {
     const e = msg.e;
     if (!e || typeof e !== "string") return;
     const att = ws.deserializeAttachment() as Attachment;
+    try {
+      if (!this.st) await this.loadStats();
+      const st = this.touch();
+      if (st) st.msgsIn++;
+      this.reportSoon();
+    } catch {}
 
     if (att.role === "host") {
       if (e === "snapshot") {
@@ -228,6 +284,10 @@ export class Room implements DurableObject {
       ws.close(code === 1005 ? 1000 : code, "bye");
     } catch {}
     this.schedulePresence();
+    try {
+      if (!this.st) await this.loadStats();
+      this.reportSoon();
+    } catch {}
   }
 
   async webSocketError(): Promise<void> {
@@ -245,17 +305,72 @@ export class Room implements DurableObject {
   }
 
   private fanout(targets: WebSocket[], frame: string): void {
+    let sent = 0;
     for (const s of targets) {
       try {
         s.send(frame);
+        sent++;
       } catch {}
     }
+    if (sent) this.countOut(sent);
   }
 
   private sendTo(ws: WebSocket, e: string, p: unknown): void {
     try {
       ws.send(JSON.stringify({ e, p }));
+      this.countOut(1);
     } catch {}
+  }
+
+  // ── usage counters (for /stats) ──
+
+  private countOut(n: number): void {
+    const st = this.touch();
+    if (st) st.msgsOut += n;
+  }
+
+  /** Today's counters; rolls over at 00:00 UTC. */
+  private touch(): RoomStats | undefined {
+    const st = this.st;
+    if (!st) return undefined;
+    if (st.day !== utcDay()) Object.assign(st, freshStats());
+    st.lastAt = Date.now();
+    return st;
+  }
+
+  private async loadStats(name?: string): Promise<void> {
+    if (name && !this.roomName) this.roomName = name;
+    if (this.st) return;
+    const [st, nm] = await Promise.all([
+      this.ctx.storage.get<RoomStats>("stats"),
+      this.ctx.storage.get<string>("roomName"),
+    ]);
+    if (!this.roomName && nm) this.roomName = nm;
+    this.st = st && st.day === utcDay() ? st : freshStats();
+  }
+
+  /** At most one report per STATS_REPORT_MS while a room is active. Never affects the relay itself. */
+  private reportSoon(): void {
+    if (this.reportTimer || !isCountedRoom(this.roomName)) return;
+    const ms = Number(this.env.STATS_REPORT_MS ?? 30_000) || 30_000;
+    this.reportTimer = setTimeout(() => {
+      this.reportTimer = null;
+      void this.flushStats();
+    }, ms);
+  }
+
+  private async flushStats(): Promise<void> {
+    try {
+      const st = this.st;
+      if (!st || !isCountedRoom(this.roomName)) return;
+      await this.ctx.storage.put({ stats: st, roomName: this.roomName });
+      await this.env.STATS.get(this.env.STATS.idFromName("registry")).fetch("https://do/report", {
+        method: "POST",
+        body: JSON.stringify({ room: this.roomName, st }),
+      });
+    } catch {
+      /* counters are best-effort */
+    }
   }
 
   private async loadThumbs(): Promise<void> {
@@ -276,6 +391,7 @@ export class Room implements DurableObject {
     if (this.snapshot && fresh) {
       try {
         ws.send(`{"e":"snapshot","p":${this.snapshot}}`);
+        this.countOut(1);
       } catch {}
     }
     if (att.thumbs) {
@@ -308,6 +424,12 @@ export class Room implements DurableObject {
         displays: this.sockets("display").length,
         controls: this.sockets("control").length,
       };
+      const st = this.touch();
+      if (st) {
+        st.peakViewers = Math.max(st.peakViewers, counts.viewers);
+        st.peakSockets = Math.max(st.peakSockets, counts.viewers + counts.displays + counts.controls);
+      }
+      this.reportSoon();
       const hostPresent = counts.host > 0;
       if (hostPresent !== this.lastHostPresent) {
         // Lets viewers fall back to (or leave) the old path when the host is not on this relay.
@@ -320,6 +442,80 @@ export class Room implements DurableObject {
       const frame = JSON.stringify({ e: "room:presence", p: counts });
       this.fanout([...this.sockets("host"), ...this.sockets("control")], frame);
     }, PRESENCE_DEBOUNCE_MS);
+  }
+}
+
+// ───────────────────────────── Registry (usage numbers for /stats) ─────────────────────────────
+// One object. Rooms report their daily counters to it (at most once per STATS_REPORT_MS while active);
+// /stats reads them back. Kept 21 days. A failure here can never affect a room.
+
+export class Registry implements DurableObject {
+  constructor(private ctx: DurableObjectState) {}
+
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    if (req.method === "POST" && url.pathname === "/report") {
+      const { room, st } = (await req.json()) as { room?: string; st?: RoomStats };
+      if (!room || !st?.day) return new Response("bad", { status: 400 });
+      await this.ctx.storage.put(`r:${st.day}:${room}`, st);
+      await this.prune(st.day);
+      return new Response("ok");
+    }
+    if (url.pathname === "/stats") {
+      const days = Math.min(Math.max(Number(url.searchParams.get("days")) || 2, 1), 14);
+      return Response.json(await this.report(days));
+    }
+    return new Response("not found", { status: 404 });
+  }
+
+  private async prune(today: string): Promise<void> {
+    if ((await this.ctx.storage.get<string>("pruned")) === today) return;
+    await this.ctx.storage.put("pruned", today);
+    const cutoff = utcDay(Date.now() - STATS_KEEP_DAYS * 86_400_000);
+    const old: string[] = [];
+    for (const k of (await this.ctx.storage.list({ prefix: "r:" })).keys()) if (k.slice(2, 12) < cutoff) old.push(k);
+    for (let i = 0; i < old.length; i += 128) await this.ctx.storage.delete(old.slice(i, i + 128));
+  }
+
+  private async report(days: number) {
+    const iso = (t: number) => new Date(t).toISOString();
+    const out: Record<string, unknown> = {};
+    for (let i = 0; i < days; i++) {
+      const day = utcDay(Date.now() - i * 86_400_000);
+      const all = await this.ctx.storage.list<RoomStats>({ prefix: `r:${day}:` });
+      const rooms = [...all.entries()].map(([k, st]) => ({ room: k.slice(13), st }));
+      const byOwner: Record<string, { rooms: number; msgsIn: number; msgsOut: number; peakViewers: number; viewerSockets: number }> = {};
+      const totals = { rooms: rooms.length, msgsIn: 0, msgsOut: 0, peakViewers: 0, peakSockets: 0 };
+      for (const { room, st } of rooms) {
+        totals.msgsIn += st.msgsIn;
+        totals.msgsOut += st.msgsOut;
+        totals.peakViewers = Math.max(totals.peakViewers, st.peakViewers);
+        totals.peakSockets = Math.max(totals.peakSockets, st.peakSockets);
+        const owner = room.split(":")[0];
+        const o = (byOwner[owner] ??= { rooms: 0, msgsIn: 0, msgsOut: 0, peakViewers: 0, viewerSockets: 0 });
+        o.rooms++;
+        o.msgsIn += st.msgsIn;
+        o.msgsOut += st.msgsOut;
+        o.peakViewers = Math.max(o.peakViewers, st.peakViewers);
+        o.viewerSockets += st.opened.viewer;
+      }
+      rooms.sort((a, b) => b.st.lastAt - a.st.lastAt);
+      out[day] = {
+        totals,
+        byOwner,
+        rooms: rooms.slice(0, 40).map(({ room, st }) => ({
+          room,
+          first: iso(st.firstAt),
+          last: iso(st.lastAt),
+          opened: st.opened,
+          msgsIn: st.msgsIn,
+          msgsOut: st.msgsOut,
+          peakViewers: st.peakViewers,
+          peakSockets: st.peakSockets,
+        })),
+      };
+    }
+    return { generatedAt: iso(Date.now()), note: "UTC days. msgsOut counts every frame delivered to a client.", days: out };
   }
 }
 
