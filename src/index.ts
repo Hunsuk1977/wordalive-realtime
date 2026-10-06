@@ -138,6 +138,9 @@ export default {
       const k = url.searchParams.get("k") ?? "";
       const expected = env.RT_SECRET ? (await hmac(env.RT_SECRET, "stats|v1")).slice(0, 24) : "";
       if (!expected || !safeEqual(expected, k)) return new Response("not found", { status: 404 });
+      if (url.searchParams.get("view") !== "json") {
+        return new Response(STATS_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+      }
       const q = new URLSearchParams();
       q.set("days", url.searchParams.get("days") ?? "2");
       return env.STATS.get(env.STATS.idFromName("registry")).fetch(`https://do/stats?${q}`);
@@ -518,6 +521,54 @@ export class Registry implements DurableObject {
     return { generatedAt: iso(Date.now()), note: "UTC days. msgsOut counts every frame delivered to a client.", days: out };
   }
 }
+
+// ───────────────────────────── usage page (/stats) ─────────────────────────────
+// A readable view of the numbers; it loads the same URL with view=json. Add new accounts to LABELS below.
+const STATS_HTML = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WORDaLIVE 사용 현황</title><style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b7280;--card:#f5f6f8;--line:#e3e5e9;--ac:#1e6fd9}
+@media(prefers-color-scheme:dark){:root{--bg:#141517;--fg:#ececec;--mut:#9aa0a6;--card:#1e2023;--line:#2e3135;--ac:#6aa8ff}}
+body{font:14px/1.5 system-ui,-apple-system,sans-serif;margin:0;padding:16px;background:var(--bg);color:var(--fg);max-width:980px;margin-inline:auto}
+h1{font-size:19px;margin:0 0 4px}h2{font-size:15px;margin:22px 0 8px}.m{color:var(--mut);font-size:12px}
+.nav a{color:var(--ac);margin-right:12px;text-decoration:none;font-weight:600}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:8px 0}
+.c{background:var(--card);border-radius:10px;padding:10px 12px}.c b{display:block;font-size:22px}.c span{color:var(--mut);font-size:12px}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}th{color:var(--mut);font-weight:600;font-size:12px}
+.wrap{overflow-x:auto}
+</style></head><body><h1>WORDaLIVE 사용 현황</h1>
+<div class="m" id="gen">불러오는 중…</div>
+<div class="nav" style="margin-top:6px"><a href="#" data-d="1">오늘</a><a href="#" data-d="2">2일</a><a href="#" data-d="7">7일</a></div>
+<div id="out"></div>
+<script>
+var LABELS={'c5c00ea1':'관리자 (baehs)','56a22fad':'GRC (gracerivermedia)'};
+var TZ='America/New_York';
+function n(x){return Number(x||0).toLocaleString('ko-KR')}
+function t(iso){return new Date(iso).toLocaleString('ko-KR',{timeZone:TZ,month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false})}
+function who(id){var k=String(id).slice(0,8);return LABELS[k]||('계정 '+k)}
+function esc(s){return String(s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
+function card(v,l){return '<div class="c"><b>'+v+'</b><span>'+l+'</span></div>'}
+function load(days){
+  var u=new URL(location.href);u.searchParams.set('view','json');u.searchParams.set('days',days);
+  fetch(u).then(function(r){return r.json()}).then(function(d){
+    document.getElementById('gen').textContent='갱신 '+t(d.generatedAt)+' (미국 동부 시간) · 날짜 구분은 UTC 기준 · 배포 이후부터 집계';
+    var h='';
+    Object.keys(d.days).forEach(function(day){
+      var x=d.days[day],tt=x.totals;
+      h+='<h2>'+day+' (UTC)</h2><div class="cards">'+card(n(tt.rooms),'방(세션)')+card(n(tt.peakViewers),'최대 동시 휴대폰')+card(n(tt.msgsOut),'전달된 메시지')+card(n(tt.msgsIn),'받은 메시지')+'</div>';
+      var o=Object.keys(x.byOwner);
+      if(o.length){h+='<div class="wrap"><table><tr><th>계정</th><th>방</th><th>최대 휴대폰</th><th>받은</th><th>전달</th></tr>';
+        o.forEach(function(k){var a=x.byOwner[k];h+='<tr><td>'+esc(who(k))+'</td><td>'+n(a.rooms)+'</td><td>'+n(a.peakViewers)+'</td><td>'+n(a.msgsIn)+'</td><td>'+n(a.msgsOut)+'</td></tr>'});h+='</table></div>'}
+      if(x.rooms.length){h+='<div class="wrap"><table style="margin-top:10px"><tr><th>시작 → 마지막</th><th>계정</th><th>최대 휴대폰</th><th>최대 접속</th><th>전달</th></tr>';
+        x.rooms.forEach(function(r){h+='<tr><td>'+t(r.first)+' → '+t(r.last)+'</td><td>'+esc(who(r.room))+'</td><td>'+n(r.peakViewers)+'</td><td>'+n(r.peakSockets)+'</td><td>'+n(r.msgsOut)+'</td></tr>'});h+='</table></div>'}
+      else h+='<div class="m">이 날은 기록이 없습니다.</div>';
+    });
+    document.getElementById('out').innerHTML=h;
+  }).catch(function(e){document.getElementById('gen').textContent='불러오지 못했습니다: '+e});
+}
+document.querySelectorAll('.nav a').forEach(function(a){a.onclick=function(e){e.preventDefault();load(a.dataset.d)}});
+load(new URL(location.href).searchParams.get('days')||2);
+<\/script></body></html>`;
 
 // ───────────────────────────── live self-test page (/selftest) ─────────────────────────────
 // Runs in the operator's browser against this deployment. The secret is typed in, never stored.
